@@ -1,0 +1,112 @@
+#dce-launcher {
+  position: fixed;
+  top: 12px;
+  right: 16px;
+  z-index: 99999;
+  background: #5865f2;
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 6px 12px;
+  font: 600 13px/1 "gg sans", system-ui, sans-serif;
+  cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+#dce-launcher:hover { background: #4752c4; }
+
+#dce-panel {
+  position: fixed;
+  top: 48px;
+  right: 16px;
+  z-index: 99999;
+  width: 300px;
+  background: #1e1f22;
+  color: #dbdee1;
+  border: 1px solid #2b2d31;
+  border-radius: 10px;
+  padding: 12px;
+  font: 13px/1.4 "gg sans", system-ui, sans-serif;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.5);
+}
+
+#dce-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-weight: 700;
+  font-size: 14px;
+  margin-bottom: 10px;
+}
+#dce-close {
+  background: none;
+  border: none;
+  color: #b5bac1;
+  cursor: pointer;
+  font-size: 14px;
+}
+#dce-close:hover { color: #fff; }
+
+#dce-panel .dce-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+#dce-panel .dce-row label {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+  color: #b5bac1;
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+}
+#dce-panel input[type="date"] {
+  background: #2b2d31;
+  border: 1px solid #1e1f22;
+  border-radius: 4px;
+  color: #dbdee1;
+  padding: 5px 6px;
+  font-size: 13px;
+  color-scheme: dark;
+}
+
+#dce-panel .dce-opts {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 8px;
+  margin-bottom: 12px;
+}
+#dce-panel .dce-opts label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  text-transform: none;
+}
+#dce-panel .dce-opts input { accent-color: #5865f2; }
+
+#dce-panel .dce-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+#dce-panel .dce-actions button {
+  flex: 1;
+  border: none;
+  border-radius: 6px;
+  padding: 8px;
+  font-weight: 600;
+  cursor: pointer;
+}
+#dce-run { background: #248046; color: #fff; }
+#dce-run:hover { background: #1a6334; }
+#dce-run:disabled { background: #3a3c41; color: #888; cursor: default; }
+#dce-stop { background: #4e2a2a; color: #f5b5b5; }
+#dce-stop:disabled { background: #3a3c41; color: #888; cursor: default; }
+
+#dce-status {
+  font-size: 12px;
+  color: #b5bac1;
+  min-height: 16px;
+}

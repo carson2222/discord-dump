@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Discord Chat Exporter",
+  "version": "1.0.0",
+  "description": "Export Discord channel messages within a date range to a .txt file. Auto-scrolls to load history.",
+  "content_scripts": [
+    {
+      "matches": ["https://discord.com/channels/*"],
+      "js": ["content.js"],
+      "css": ["panel.css"],
+      "run_at": "document_idle"
+    }
+  ]
+}
