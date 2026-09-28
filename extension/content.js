@@ -1,339 +1,430 @@
-/* Discord Chat Exporter — content script
- * Injects a floating panel on discord.com/channels/* to export messages
- * within a date range to a .txt file. Auto-scrolls to load history.
- *
- * Selectors validated against Discord web (June 2026). Discord ships hashed
- * class names that change over time, so everything uses prefix/contains
- * matching ([class*="..."]) and stable id prefixes to survive minor updates.
- */
 (() => {
   "use strict";
 
-  if (window.__dceLoaded) return;
-  window.__dceLoaded = true;
+  if (window.__discordDumpLoaded) return;
+  window.__discordDumpLoaded = true;
 
-  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-  const truncate = (s, n) => (s.length > n ? s.slice(0, n - 1) + "\u2026" : s);
+  const { format, kfmt } = globalThis.DiscordDumpFormat;
+  const storage = localStore();
+  const API = "/api/v9";
+  const EPOCH = 1420070400000n;
+  const DAY = 864e5;
+  const RATE_LIMIT_PAD_MS = 250;
 
-  // ---------- DOM access ----------
-
-  // The scrollable element that owns the message list (ol.scrollerInner_*).
-  function getScroller() {
-    const ol = document.querySelector('ol[class*="scrollerInner_"]');
-    if (!ol) return null;
-    let el = ol.parentElement;
-    while (el && el !== document.body) {
-      const oy = getComputedStyle(el).overflowY;
-      if ((oy === "auto" || oy === "scroll") && el.scrollHeight > el.clientHeight) {
-        return el;
-      }
-      el = el.parentElement;
+  function localStore() {
+    if (window.localStorage) return window.localStorage;
+    const frame = document.createElement("iframe");
+    frame.style.display = "none";
+    try {
+      document.documentElement.appendChild(frame);
+      return Object.getOwnPropertyDescriptor(frame.contentWindow, "localStorage").get.call(window);
+    } catch {
+      return null;
+    } finally {
+      frame.remove();
     }
-    return null;
   }
 
-  function channelName() {
-    // Header title in the toolbar; fall back to document title / URL.
-    const h =
-      document.querySelector('section[aria-label] h1') ||
-      document.querySelector('[class*="title_"] h1') ||
-      document.querySelector('header [class*="title_"]');
-    let name = h ? h.textContent.trim() : "";
-    if (!name) {
-      const m = document.title.match(/#[^|]+/);
-      name = m ? m[0].trim() : "discord-export";
-    }
-    return name.replace(/[^\w\-\u00C0-\uFFFF]+/g, "_").replace(/^_+|_+$/g, "") || "discord-export";
-  }
-
-  // ---------- Extraction ----------
-
-  function extract(li) {
-    const time = li.querySelector('time[id^="message-timestamp-"]');
-    const iso = time ? time.getAttribute("datetime") : null;
-
-    const uEl = li.querySelector('[id^="message-username-"] [class*="username_"]');
-    const author = uEl ? (uEl.getAttribute("data-text") || uEl.textContent.trim()) : null;
-
-    const cEl = li.querySelector(
-      '[id^="message-content-"]:not([class*="repliedTextContent"])'
-    );
-    const text = cEl ? cEl.innerText.trim() : "";
-
-    let replyTo = null;
-    const reply = li.querySelector('[class*="repliedMessage_"]');
-    if (reply) {
-      const ru = reply.querySelector('[class*="username_"]');
-      const rc = reply.querySelector('[class*="repliedTextContent_"]');
-      replyTo = {
-        author: ru ? (ru.getAttribute("data-text") || ru.textContent.trim()).replace(/^@/, "") : null,
-        preview: rc ? rc.innerText.trim() : "",
+  function sleep(ms, signal) {
+    return new Promise((resolve, reject) => {
+      signal.throwIfAborted();
+      const onAbort = () => {
+        clearTimeout(timer);
+        reject(signal.reason);
       };
-    }
-
-    const attachments = [];
-    const acc = li.querySelector('[id^="message-accessories-"]');
-    if (acc) {
-      acc.querySelectorAll("a[href]").forEach((a) => {
-        if (a.href && !attachments.includes(a.href)) attachments.push(a.href);
-      });
-      acc.querySelectorAll("img[src]").forEach((i) => {
-        if (i.src && !i.src.startsWith("data:") && !attachments.includes(i.src)) {
-          attachments.push(i.src);
-        }
-      });
-    }
-
-    const id = li.id.split("-").pop();
-    return { id, iso, tsMs: iso ? Date.parse(iso) : 0, author, text, replyTo, attachments };
-  }
-
-  // Harvest all messages currently in the DOM (in visual order) into a Map.
-  // Continuation messages (no username header) inherit the last seen author.
-  function harvest(map) {
-    const lis = document.querySelectorAll('li[id^="chat-messages-"]');
-    let lastAuthor = null;
-    lis.forEach((li) => {
-      const m = extract(li);
-      if (m.author) lastAuthor = m.author;
-      else m.author = lastAuthor || "(unknown)";
-      if (m.id && !map.has(m.id)) map.set(m.id, m);
+      const timer = setTimeout(() => {
+        signal.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      signal.addEventListener("abort", onAbort, { once: true });
     });
   }
 
-  // ---------- Scroll engine ----------
+  // ---------- session: reuse the headers Discord itself sends ----------
 
-  // Signature of the currently mounted message window. Changes whenever
-  // Discord mounts/unmounts rows, letting us proceed the instant new
-  // history renders instead of waiting a fixed delay.
-  function listSig(scroller) {
-    const lis = document.querySelectorAll('li[id^="chat-messages-"]');
-    const first = lis[0] ? lis[0].id : "";
-    const last = lis[lis.length - 1] ? lis[lis.length - 1].id : "";
-    return lis.length + "|" + first + "|" + last + "|" + scroller.scrollHeight;
+  const WANT = new Set(["authorization", "x-super-properties", "x-discord-locale", "x-discord-timezone", "x-debug-options"]);
+  const captured = {};
+  const apiXhr = new WeakSet();
+  const origOpen = XMLHttpRequest.prototype.open;
+  const origSet = XMLHttpRequest.prototype.setRequestHeader;
+
+  function isApiUrl(url) {
+    try {
+      const u = new URL(url, location.href);
+      return u.origin === location.origin && /^\/api\/v\d+\//.test(u.pathname);
+    } catch {
+      return false;
+    }
   }
 
-  // Resolve as soon as the rendered window changes (new rows mounted) or the
-  // scroll position settles, capped by maxMs. Much faster than a flat sleep.
-  async function waitForRender(scroller, prevSig, maxMs) {
-    const t0 = performance.now();
-    while (performance.now() - t0 < maxMs) {
-      await sleep(30);
-      if (listSig(scroller) !== prevSig) {
-        await sleep(40); // let the batch finish painting
-        return true;
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    apiXhr.delete(this);
+    const result = origOpen.call(this, method, url, ...rest);
+    if (isApiUrl(url)) apiXhr.add(this);
+    return result;
+  };
+  XMLHttpRequest.prototype.setRequestHeader = function (key, value) {
+    const result = origSet.call(this, key, value);
+    const k = String(key).toLowerCase();
+    if (apiXhr.has(this) && WANT.has(k)) captured[k] = value;
+    return result;
+  };
+
+  function findInClient(test) {
+    let found = null;
+    try {
+      window.webpackChunkdiscord_app.push([[Symbol("discord-dump")], {}, (req) => {
+        for (const id in req.c) {
+          const e = req.c[id] && req.c[id].exports;
+          if (!e) continue;
+          for (const k of [e, e.default, e.Z, e.A, e.Ay]) {
+            try {
+              if (!found && k && test(k)) found = k;
+            } catch {}
+          }
+        }
+      }]);
+      window.webpackChunkdiscord_app.pop();
+    } catch {}
+    return found;
+  }
+
+  function tokenFromClient() {
+    const auth = findInClient((k) => typeof k.getToken === "function" && typeof k.getToken() === "string" && k.getToken().length > 20);
+    return auth ? auth.getToken() : null;
+  }
+
+  function headers() {
+    const h = { ...captured };
+    if (!h.authorization) h.authorization = tokenFromClient();
+    if (!h.authorization) throw new Error("Couldn't read your Discord session. Reload the tab and try again.");
+    return h;
+  }
+
+  let cooldownUntil = 0;
+
+  const isGlobalLimit = (r, body) =>
+    body.global === true || r.headers.get("x-ratelimit-global") === "true" || r.headers.get("x-ratelimit-scope") === "global";
+
+  async function api(path, signal) {
+    for (let attempt = 0; ; attempt++) {
+      while (cooldownUntil > Date.now()) await sleep(cooldownUntil - Date.now(), signal);
+      const r = await fetch(API + path, { headers: headers(), signal });
+      if (r.ok) return r.json();
+      if (r.status === 429) {
+        const body = await r.json().catch(() => ({}));
+        const wait = (Number(body.retry_after) || 1) * 1000 + RATE_LIMIT_PAD_MS;
+        if (isGlobalLimit(r, body)) cooldownUntil = Math.max(cooldownUntil, Date.now() + wait);
+        else await sleep(wait, signal);
+        continue;
+      }
+      if (r.status >= 500 && attempt < 3) {
+        await sleep(1000 * (attempt + 1), signal);
+        continue;
+      }
+      const err = new Error(`Discord answered ${r.status}`);
+      err.status = r.status;
+      throw err;
+    }
+  }
+
+  const tryApi = (path, signal) => api(path, signal).catch(() => null);
+  const toSnowflake = (ms) => (ms <= Number(EPOCH) ? 0n : (BigInt(Math.floor(ms)) - EPOCH) << 22n);
+  const snowflakeMs = (id) => Number((BigInt(id) >> 22n) + EPOCH);
+  const utcDay = (ms) => new Date(ms).toISOString().slice(0, 10);
+
+  // ---------- metadata ----------
+
+  const THREAD_TYPES = new Set([10, 11, 12]);
+  const CONTAINER_NOTICES = new Map([
+    [4, "This is a category. Open one of its channels and export that."],
+    [15, "This is a forum. Open a post and export that."],
+    [16, "This is a media channel. Open a post and export that."],
+  ]);
+  const MOD_BITS = [1n << 1n, 1n << 2n, 1n << 3n, 1n << 5n, 1n << 13n, 1n << 28n, 1n << 40n];
+
+  function staffRolesOf(roles, guildId) {
+    const listed = roles.filter((r) => r.hoist && !r.managed && r.id !== guildId);
+    const modPositions = listed.filter((r) => MOD_BITS.some((b) => BigInt(r.permissions) & b)).map((r) => r.position);
+    if (!modPositions.length) return [];
+    const floor = Math.min(...modPositions);
+    return listed.filter((r) => r.position >= floor).sort((a, b) => b.position - a.position).slice(0, 10);
+  }
+
+  async function loadMeta(channelId, signal) {
+    const c = await api(`/channels/${channelId}`, signal);
+    const notice = CONTAINER_NOTICES.get(c.type);
+    if (notice) return { notice };
+    const meta = { channel: { name: c.name ? "#" + c.name : "", topic: c.topic || "" }, roles: new Map(), channels: new Map(), staffRoles: [] };
+    if (!c.guild_id) {
+      const people = (c.recipients || []).map((u) => u.global_name || u.username);
+      meta.channel.guild = "Direct Messages";
+      meta.channel.name = c.name || people.join(", ");
+      return meta;
+    }
+    const isThread = THREAD_TYPES.has(c.type);
+    const [guild, roles, parent] = await Promise.all([
+      tryApi(`/guilds/${c.guild_id}`, signal),
+      tryApi(`/guilds/${c.guild_id}/roles`, signal),
+      isThread ? tryApi(`/channels/${c.parent_id}`, signal) : null,
+    ]);
+    meta.guildId = c.guild_id;
+    meta.channel.guild = guild ? guild.name : document.title.split("|").pop().trim();
+    if (isThread) {
+      meta.channel.parent = parent ? parent.name : "";
+      meta.channel.name = "thread: " + c.name;
+    }
+    for (const r of roles || []) meta.roles.set(r.id, r.name);
+    meta.staffRoles = roles ? staffRolesOf(roles, c.guild_id) : null;
+    return meta;
+  }
+
+  const STAFF_TTL = 7 * DAY;
+
+  async function loadChannelNames(meta, signal) {
+    if (!meta.guildId) return;
+    const store = findInClient((k) => typeof k.getName === "function" && k.getName() === "ChannelStore" && typeof k.getChannel === "function");
+    if (store) {
+      meta.channels = { get: (id) => (store.getChannel(id) || {}).name };
+      return;
+    }
+    for (const ch of (await tryApi(`/guilds/${meta.guildId}/channels`, signal)) || []) meta.channels.set(ch.id, ch.name);
+  }
+
+  async function loadStaff(meta, signal) {
+    if (!meta.guildId) return new Map();
+    const key = `discord-dump-staff-${meta.guildId}`;
+    let cached = null;
+    try {
+      cached = JSON.parse(storage.getItem(key) || "null");
+    } catch {}
+    const fallback = () => new Map(cached ? cached.entries : []);
+    if (!meta.staffRoles) return fallback();
+    const roleKey = meta.staffRoles.map((r) => r.id + r.name).join();
+    if (cached && cached.roleKey === roleKey && Date.now() - cached.at < STAFF_TTL) return fallback();
+
+    const staff = new Map();
+    let complete = true;
+    for (const role of meta.staffRoles) {
+      try {
+        const ids = await api(`/guilds/${meta.guildId}/roles/${role.id}/member-ids`, signal);
+        for (const id of ids) if (!staff.has(id)) staff.set(id, role.name);
+      } catch (e) {
+        if (signal.aborted) throw e;
+        complete = false;
       }
     }
-    return false; // nothing changed (likely at top / loading stalled)
+    if (!complete) return cached ? fallback() : staff;
+    try {
+      storage.setItem(key, JSON.stringify({ at: Date.now(), roleKey, entries: [...staff] }));
+    } catch {}
+    return staff;
   }
 
-  async function collect(fromMs, toMs, onProgress, shouldStop) {
-    const scroller = getScroller();
-    if (!scroller) throw new Error("Message scroller not found. Open a text channel first.");
+  // ---------- messages: walk forward from the start of the range ----------
 
-    const map = new Map();
-    // Step ~85% of the viewport: aggressive, but the ~15% overlap (plus
-    // Discord's off-screen render buffer) guarantees no rows are skipped.
-    const step = () => Math.max(300, scroller.clientHeight * 0.85);
-    const SETTLE_MS = 650; // max wait per step before assuming stall/top
-    let stagnant = 0;
-    let lastSize = -1;
-
-    harvest(map);
-
-    while (true) {
-      if (shouldStop()) break;
-
-      const tss = [...map.values()].map((m) => m.tsMs).filter(Boolean);
-      const oldest = tss.length ? Math.min(...tss) : Infinity;
-      onProgress(map.size, oldest);
-
-      // Loaded far enough into the past.
-      if (oldest <= fromMs) break;
-
-      const before = listSig(scroller);
-      scroller.scrollTop = Math.max(0, scroller.scrollTop - step());
-      const changed = await waitForRender(scroller, before, SETTLE_MS);
-      harvest(map);
-
-      // Top-of-history detection: pinned at top, render didn't change, and
-      // no new messages collected for several consecutive passes.
-      const atTop = scroller.scrollTop <= 1;
-      if (atTop && !changed && map.size === lastSize) {
-        if (++stagnant >= 3) break; // reached beginning of channel
-      } else {
-        stagnant = 0;
+  async function collect(channelId, fromMs, toMs, onProgress, signal) {
+    const messages = [];
+    const startMs = Math.max(fromMs, snowflakeMs(channelId));
+    const endMs = Math.min(toMs, Date.now());
+    let after = toSnowflake(fromMs);
+    if (after > 0n) after -= 1n;
+    try {
+      while (true) {
+        const page = await api(`/channels/${channelId}/messages?limit=100&after=${after}`, signal);
+        if (!page.length) break;
+        page.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+        let pastEnd = false;
+        for (const m of page) {
+          if (Date.parse(m.timestamp) > toMs) { pastEnd = true; break; }
+          messages.push(m);
+        }
+        after = BigInt(page[page.length - 1].id);
+        const at = Date.parse(page[page.length - 1].timestamp);
+        onProgress(messages.length, Math.min(1, Math.max(0, (at - startMs) / Math.max(1, endMs - startMs))), at);
+        if (pastEnd || page.length < 100) break;
       }
-      lastSize = map.size;
+    } catch (e) {
+      return signal.aborted ? { messages, stopped: true } : { messages, error: e };
     }
-
-    harvest(map);
-    return [...map.values()]
-      .filter((m) => m.tsMs >= fromMs && m.tsMs <= toMs)
-      .sort((a, b) => a.tsMs - b.tsMs);
+    return { messages };
   }
 
-  // ---------- Formatting ----------
+  // ---------- output ----------
 
-  function formatTxt(msgs, opt, meta) {
-    const lines = [];
-    lines.push(`# ${meta.channel}`);
-    lines.push(`# Range: ${meta.from} \u2014 ${meta.to}`);
-    lines.push(`# Messages: ${msgs.length}`);
-    lines.push(`# Exported: ${new Date().toLocaleString()}`);
-    lines.push("");
-
-    for (const m of msgs) {
-      const block = [];
-      if (opt.replyTo && m.replyTo) {
-        block.push(`\u21B3 reply to ${m.replyTo.author || "?"}: ${truncate(m.replyTo.preview, 100)}`);
-      }
-      const head = [];
-      if (opt.timestamp && m.iso) head.push(`[${new Date(m.iso).toLocaleString()}]`);
-      if (opt.author) head.push(m.author || "(unknown)");
-      const prefix = head.length ? head.join(" ") + ": " : "";
-      block.push(prefix + (m.text || (m.attachments.length ? "" : "(no text)")));
-      if (opt.attachments && m.attachments.length) {
-        m.attachments.forEach((a) => block.push(`  [attachment] ${a}`));
-      }
-      lines.push(block.join("\n"));
-    }
-    return lines.join("\n\n") + "\n";
-  }
+  const safe = (s) => (s || "").replace(/[^\p{L}\p{N}_-]+/gu, "_").replace(/^_+|_+$/g, "").slice(0, 60);
 
   function download(text, filename) {
-    const blob = new Blob([text], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
+    const url = URL.createObjectURL(new Blob([text], { type: "text/plain;charset=utf-8" }));
     const a = document.createElement("a");
     a.href = url;
     a.download = filename;
     document.body.appendChild(a);
     a.click();
     a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 2000);
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
+
+  const duration = (ms) => {
+    const s = Math.max(0, Math.round(ms / 1000));
+    return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+  };
 
   // ---------- UI ----------
 
-  let stopFlag = false;
-
-  function fmtDate(d) {
-    return d.toISOString().slice(0, 10);
-  }
+  const PRESETS = [["30d", 30], ["90d", 90], ["1y", 365], ["2y", 730], ["All", 0]];
 
   function buildPanel() {
-    const today = new Date();
-    const weekAgo = new Date(today.getTime() - 7 * 864e5);
-
-    const launcher = document.createElement("button");
-    launcher.id = "dce-launcher";
-    launcher.textContent = "Export";
-    launcher.title = "Discord Chat Exporter";
-
     const panel = document.createElement("div");
-    panel.id = "dce-panel";
-    panel.style.display = "none";
+    panel.id = "dd-panel";
+    panel.hidden = true;
+    panel.tabIndex = -1;
+    panel.setAttribute("role", "dialog");
+    panel.setAttribute("aria-label", "discord-dump");
     panel.innerHTML = `
-      <div id="dce-head">
-        <span>Chat Exporter</span>
-        <button id="dce-close" title="Close">\u2715</button>
+      <div id="dd-head">
+        <span>discord-dump</span>
+        <button id="dd-close" type="button" aria-label="Close">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><path d="M4 4l8 8M12 4l-8 8"/></svg>
+        </button>
       </div>
-      <div class="dce-row">
-        <label>From <input type="date" id="dce-from" value="${fmtDate(weekAgo)}"></label>
-        <label>To <input type="date" id="dce-to" value="${fmtDate(today)}"></label>
+      <div class="dd-presets" role="group" aria-label="Range">${PRESETS.map(([l]) => `<button type="button" data-preset="${l}" aria-pressed="false">${l}</button>`).join("")}</div>
+      <div class="dd-row">
+        <label>From (UTC) <input type="date" id="dd-from"></label>
+        <label>To (UTC) <input type="date" id="dd-to"></label>
       </div>
-      <div class="dce-opts">
-        <label><input type="checkbox" id="dce-o-author" checked> Author</label>
-        <label><input type="checkbox" id="dce-o-timestamp" checked> Timestamp</label>
-        <label><input type="checkbox" id="dce-o-replyTo" checked> Reply-to</label>
-        <label><input type="checkbox" id="dce-o-attachments" checked> Attachments</label>
+      <button id="dd-run" type="button">Export .txt</button>
+      <div id="dd-bar"><div></div></div>
+      <div class="dd-foot">
+        <div id="dd-status" role="status">Pick a range.</div>
+        <button id="dd-stop" type="button" disabled>Stop</button>
       </div>
-      <div class="dce-actions">
-        <button id="dce-run">Export .txt</button>
-        <button id="dce-stop" disabled>Stop</button>
-      </div>
-      <div id="dce-status">Idle.</div>
     `;
+    document.body.append(panel);
 
-    document.body.appendChild(launcher);
-    document.body.appendChild(panel);
+    const $ = (sel) => panel.querySelector(sel);
+    const status = $("#dd-status");
+    const bar = $("#dd-bar > div");
+    const fromEl = $("#dd-from");
+    const toEl = $("#dd-to");
+    const presetButtons = [...panel.querySelectorAll("[data-preset]")];
+    let controller = null;
 
-    const $ = (id) => panel.querySelector(id);
-    const status = $("#dce-status");
-
-    launcher.onclick = () => {
-      panel.style.display = panel.style.display === "none" ? "block" : "none";
+    const markPreset = (label) => presetButtons.forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.preset === label)));
+    const setPreset = (label) => {
+      const days = PRESETS.find(([l]) => l === label)[1];
+      const now = Date.now();
+      toEl.value = utcDay(now);
+      fromEl.value = days ? utcDay(now - days * DAY) : "";
+      markPreset(label);
+      status.textContent = days ? `Last ${label}.` : "Whole channel history.";
     };
-    $("#dce-close").onclick = () => (panel.style.display = "none");
+    presetButtons.forEach((b) => (b.onclick = () => setPreset(b.dataset.preset)));
+    [fromEl, toEl].forEach((el) => (el.oninput = () => markPreset(null)));
+    setPreset("30d");
 
-    $("#dce-run").onclick = async () => {
-      const fromVal = $("#dce-from").value;
-      const toVal = $("#dce-to").value;
-      if (!fromVal || !toVal) {
-        status.textContent = "Pick both dates.";
+    window.addEventListener("discord-dump:toggle", () => {
+      panel.hidden = !panel.hidden;
+      if (!panel.hidden) panel.focus({ preventScroll: true });
+    });
+    panel.addEventListener("keydown", (e) => {
+      if (e.key !== "Escape") return;
+      e.stopPropagation();
+      panel.hidden = true;
+    });
+    $("#dd-close").onclick = () => (panel.hidden = true);
+    $("#dd-stop").onclick = () => {
+      controller.abort();
+      status.textContent = "Stopping, saving what's loaded\u2026";
+    };
+
+    $("#dd-run").onclick = async () => {
+      const [, , guildPart, channelId] = location.pathname.split("/");
+      if (!/^\d+$/.test(channelId || "")) {
+        status.textContent = "Open a channel first.";
         return;
       }
-      const fromMs = new Date(fromVal + "T00:00:00").getTime();
-      const toMs = new Date(toVal + "T23:59:59.999").getTime();
+      const fromMs = fromEl.value ? Date.parse(fromEl.value + "T00:00:00Z") : 0;
+      const toMs = toEl.value ? Date.parse(toEl.value + "T23:59:59.999Z") : Date.now();
       if (fromMs > toMs) {
         status.textContent = "'From' is after 'To'.";
         return;
       }
+      const from = fromEl.value || utcDay(snowflakeMs(channelId));
+      const to = toEl.value || utcDay(Date.now());
 
-      const opt = {
-        author: $("#dce-o-author").checked,
-        timestamp: $("#dce-o-timestamp").checked,
-        replyTo: $("#dce-o-replyTo").checked,
-        attachments: $("#dce-o-attachments").checked,
-      };
-
-      stopFlag = false;
-      $("#dce-run").disabled = true;
-      $("#dce-stop").disabled = false;
+      controller = new AbortController();
+      const { signal } = controller;
+      $("#dd-run").disabled = true;
+      $("#dd-stop").disabled = false;
+      bar.style.width = "0%";
+      const t0 = performance.now();
 
       try {
-        const msgs = await collect(
+        status.textContent = "Reading channel info\u2026";
+        const meta = await loadMeta(channelId, signal);
+        if (meta.notice) {
+          status.textContent = meta.notice;
+          return;
+        }
+        const extrasPromise = Promise.all([loadStaff(meta, signal), loadChannelNames(meta, signal)]).catch(() => [new Map()]);
+        const { messages, stopped, error } = await collect(
+          channelId,
           fromMs,
           toMs,
-          (count, oldestMs) => {
-            const oldest = Number.isFinite(oldestMs)
-              ? new Date(oldestMs).toLocaleDateString()
-              : "\u2014";
-            status.textContent = `Scrolling\u2026 ${count} loaded, oldest ${oldest}`;
+          (count, frac, at) => {
+            const elapsed = performance.now() - t0;
+            const eta = frac > 0.02 ? ` ETA ${duration((elapsed / frac) * (1 - frac))}` : "";
+            bar.style.width = (frac * 100).toFixed(1) + "%";
+            status.textContent = `${count.toLocaleString()} msgs, at ${utcDay(at)}, ${Math.round(frac * 100)}%.${eta}`;
           },
-          () => stopFlag
+          signal
         );
+        if (!messages.length) {
+          if (error) throw error;
+          status.textContent = stopped ? "Stopped before anything loaded." : "No messages in that range.";
+          return;
+        }
+        status.textContent = "Tagging staff and channels\u2026";
+        const [staff] = await extrasPromise;
+        const untagged = signal.aborted && !stopped ? " Stopped before staff were tagged." : "";
 
-        if (!msgs.length) {
-          status.textContent = "No messages in that range.";
+        const partial = error ? `stopped by an error (${error.message})` : stopped ? "stopped early" : null;
+        const { text, stats } = format({
+          messages,
+          channel: meta.channel,
+          range: { from, to },
+          staff,
+          roles: meta.roles,
+          channels: meta.channels,
+          partial,
+          url: `https://discord.com/channels/${guildPart}/${channelId}`,
+        });
+        const name = ["discord", safe(meta.channel.guild), safe(meta.channel.parent), safe(meta.channel.name), from, "to", to].filter(Boolean).join("_");
+        download(text, `${name}${partial ? "_partial" : ""}.txt`);
+        bar.style.width = "100%";
+        const summary = `${stats.messages.toLocaleString()} msgs, ${stats.lines.toLocaleString()} lines, ~${kfmt(stats.tokens)} tokens in ${duration(performance.now() - t0)}.`;
+        if (error) {
+          status.textContent = `Error: ${error.message}. Saved a partial file: ${summary}`;
+          console.error("[discord-dump]", error);
         } else {
-          const channel = channelName();
-          const text = formatTxt(msgs, opt, {
-            channel,
-            from: fromVal,
-            to: toVal,
-          });
-          download(text, `${channel}_${fromVal}_to_${toVal}.txt`);
-          status.textContent = `Done. Exported ${msgs.length} messages.`;
+          status.textContent = `${stopped ? "Partial. " : "Done. "}${summary}${untagged}`;
         }
       } catch (e) {
+        if (signal.aborted) {
+          status.textContent = "Stopped before anything loaded.";
+          return;
+        }
         status.textContent = "Error: " + e.message;
-        console.error("[DCE]", e);
+        console.error("[discord-dump]", e);
       } finally {
-        $("#dce-run").disabled = false;
-        $("#dce-stop").disabled = true;
+        controller.abort();
+        $("#dd-run").disabled = false;
+        $("#dd-stop").disabled = true;
       }
     };
-
-    $("#dce-stop").onclick = () => {
-      stopFlag = true;
-      status.textContent = "Stopping\u2026";
-    };
   }
 
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", buildPanel);
-  } else {
-    buildPanel();
-  }
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", buildPanel);
+  else buildPanel();
 })();

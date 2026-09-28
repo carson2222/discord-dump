@@ -1,14 +1,19 @@
 {
   "manifest_version": 3,
-  "name": "Discord Chat Exporter",
+  "name": "discord-dump",
   "version": "1.0.0",
-  "description": "Export Discord channel messages within a date range to a .txt file. Auto-scrolls to load history.",
+  "description": "Export a Discord channel as one compact text file for LLM agents.",
+  "action": { "default_title": "discord-dump" },
+  "background": { "service_worker": "background.js" },
+  "permissions": ["scripting"],
+  "host_permissions": ["https://discord.com/*"],
   "content_scripts": [
     {
-      "matches": ["https://discord.com/channels/*"],
-      "js": ["content.js"],
+      "matches": ["https://discord.com/*"],
+      "js": ["format.js", "content.js"],
       "css": ["panel.css"],
-      "run_at": "document_idle"
+      "run_at": "document_start",
+      "world": "MAIN"
     }
   ]
 }
